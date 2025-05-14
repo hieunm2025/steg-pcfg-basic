@@ -1,0 +1,808 @@
+ubuntu@steg-pcfg-basic:~$ cat generator.py 
+#!/usr/bin/env python3
+"""
+PCFG Steganography Encoder
+
+Mã hóa thông điệp bí mật vào văn bản tự nhiên sử dụng ngữ pháp PCFG.
+"""
+import sys
+import re
+import random
+import hashlib
+import heapq
+import logging
+from collections import Counter
+
+# Thiết lập logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+class PCFGSteganography:
+    """
+    Lớp thực hiện giấu tin dựa trên Probabilistic Context-Free Grammar (PCFG).
+    """
+    def __init__(self, grammar_file):
+        """
+        Khởi tạo đối tượng giấu tin PCFG.
+        
+        Args:
+            grammar_file (str): Đường dẫn đến tệp ngữ pháp PCFG.
+        """
+        self.grammar = {}
+        self.probabilities = {}
+        self.static_texts = []
+        self.huffman_codes_cache = {}
+        self.load_grammar(grammar_file)
+        
+    def load_grammar(self, grammar_file):
+        """
+        Đọc và phân tích tệp ngữ pháp PCFG.
+        
+        Args:
+            grammar_file (str): Đường dẫn đến tệp ngữ pháp PCFG.
+        
+        Raises:
+            FileNotFoundError: Nếu không tìm thấy tệp ngữ pháp.
+            ValueError: Nếu cú pháp ngữ pháp không hợp lệ.
+        """
+        try:
+            with open(grammar_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            current_symbol = None
+            for line_num, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                    
+                if '→' in line:
+                    parts = line.split('→')
+                    if len(parts) != 2:
+                        raise ValueError(f"Lỗi cú pháp ở dòng {line_num}: {line}")
+                        
+                    current_symbol = parts[0].strip()
+                    options_str = parts[1].strip()
+                    options = []
+                    probabilities = []
+                    
+                    for opt in options_str.split('||'):
+                        opt = opt.strip()
+                        if not opt:
+                            continue
+                            
+                        opt_parts = opt.split('|')
+                        if len(opt_parts) < 1:
+                            raise ValueError(f"Lỗi cú pháp ở dòng {line_num}: {opt}")
+                            
+                        rule = opt_parts[0].strip()
+                        
+                        try:
+                            prob = float(opt_parts[1].strip()) if len(opt_parts) > 1 else 1.0
+                            if prob < 0 or prob > 1:
+                                raise ValueError(f"Xác suất phải nằm trong khoảng [0, 1] ở dòng {line_num}")
+                        except ValueError:
+                            raise ValueError(f"Xác suất không hợp lệ ở dòng {line_num}: {opt_parts[1] if len(opt_parts) > 1 else '1.0'}")
+                            
+                        options.append(rule)
+                        probabilities.append(prob)
+                    
+                    # Kiểm tra tổng xác suất
+                    total_prob = sum(probabilities)
+                    if abs(total_prob - 1.0) > 0.01 and len(options) > 1:  # Cho phép sai số nhỏ
+                        logger.warning(f"Tổng xác suất cho {current_symbol} là {total_prob}, không bằng 1.0")
+                        # Chuẩn hóa xác suất
+                        probabilities = [p/total_prob for p in probabilities]
+                    
+                    self.grammar[current_symbol] = options
+                    self.probabilities[current_symbol] = probabilities
+            
+            # Kiểm tra tính hợp lệ của ngữ pháp
+            if 'Start' not in self.grammar:
+                raise ValueError("Ngữ pháp phải có biểu tượng 'Start'")
+                
+            logger.info(f"Đã tải ngữ pháp với {len(self.grammar)} biểu tượng không kết thúc")
+            
+        except FileNotFoundError:
+            logger.error(f"Không tìm thấy tệp ngữ pháp: {grammar_file}")
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi khi tải ngữ pháp: {str(e)}")
+            raise
+
+    def build_huffman_codes(self, symbol):
+        """
+        Xây dựng mã Huffman cho một biểu tượng không kết thúc.
+        
+        Args:
+            symbol (str): Biểu tượng không kết thúc cần xây dựng mã Huffman.
+            
+        Returns:
+            dict: Từ điển ánh xạ từ lựa chọn đến mã Huffman.
+        """
+        # Kiểm tra cache trước
+        if symbol in self.huffman_codes_cache:
+            return self.huffman_codes_cache[symbol]
+            
+        # Nếu chỉ có một lựa chọn, không cần mã hóa
+        if len(self.grammar[symbol]) <= 1:
+            self.huffman_codes_cache[symbol] = {self.grammar[symbol][0]: ''}
+            return self.huffman_codes_cache[symbol]
+            
+        # Xây dựng heap cho thuật toán Huffman
+        heap = [[prob, [opt, ""]] for opt, prob in zip(self.grammar[symbol], self.probabilities[symbol])]
+        heapq.heapify(heap)
+        
+        # Thuật toán Huffman
+        while len(heap) > 1:
+            lo = heapq.heappop(heap)
+            hi = heapq.heappop(heap)
+            for pair in lo[1:]:
+                pair[1] = '0' + pair[1]
+            for pair in hi[1:]:
+                pair[1] = '1' + pair[1]
+            heapq.heappush(heap, [lo[0] + hi[0]] + lo[1:] + hi[1:])
+        
+        # Lưu kết quả vào cache
+        result = {pair[0]: pair[1] for pair in heapq.heappop(heap)[1:]}
+        self.huffman_codes_cache[symbol] = result
+        return result
+
+    def check_letter_frequency(self, text):
+        """
+        Kiểm tra tần suất xuất hiện của chữ cái trong văn bản để đảm bảo tính tự nhiên.
+        
+        Args:
+            text (str): Văn bản cần kiểm tra.
+            
+        Returns:
+            bool: True nếu tần suất tự nhiên, False nếu không.
+        """
+        from collections import Counter
+        
+        # Chỉ tính chữ cái
+        freq = Counter(c.lower() for c in text if c.isalpha())
+        total = sum(freq.values())
+        
+        # Nếu văn bản quá ngắn, coi là tự nhiên
+        if total < 20:
+            return True
+            
+        # Tần suất mong đợi của các chữ cái tiếng Anh (xấp xỉ)
+        expected = {
+            'e': 0.12, 't': 0.09, 'a': 0.08, 'o': 0.075, 'i': 0.07,
+            'n': 0.067, 's': 0.063, 'h': 0.061, 'r': 0.06, 'd': 0.043,
+            'l': 0.04, 'u': 0.028, 'c': 0.028, 'm': 0.025, 'w': 0.024,
+            'f': 0.022, 'g': 0.02, 'y': 0.02, 'p': 0.019, 'b': 0.015,
+            'v': 0.01, 'k': 0.008, 'j': 0.002, 'x': 0.002, 'q': 0.001, 'z': 0.001
+        }
+        
+        # Kiểm tra các chữ cái quan trọng
+        key_letters = ['e', 't', 'a', 'o', 'i', 'n', 's', 'z', 'q', 'x']
+        for letter in key_letters:
+            act_freq = freq.get(letter, 0) / total
+            exp_freq = expected.get(letter, 0.01)
+            # Cho phép sai lệch tối đa 50%
+            if abs(act_freq - exp_freq) > 0.5 * exp_freq:
+                return False
+                
+        return True
+
+    def encode(self, binary_data, max_attempts=15, attempt=0):
+        """
+        Mã hóa thông điệp nhị phân thành văn bản sử dụng ngữ pháp PCFG.
+        
+        Args:
+            binary_data (str): Chuỗi nhị phân cần mã hóa.
+            max_attempts (int, optional): Số lần thử tối đa. Mặc định là 15.
+            attempt (int, optional): Số lần đã thử. Mặc định là 0.
+            
+        Returns:
+            str: Văn bản đã mã hóa.
+        """
+        if attempt >= max_attempts:
+            logger.warning(f"Đã đạt số lần thử tối đa ({max_attempts}), trả về văn bản tốt nhất có thể")
+            return '\n'.join(self.last_result) if hasattr(self, 'last_result') else "Không thể tạo văn bản phù hợp."
+        
+        result = []
+        bit_index = 0
+        sentence = []
+        encoded_symbols = {}  # Theo dõi các biểu tượng đã mã hóa
+        
+        # Bắt đầu từ biểu tượng Start
+        stack = ['Start']
+        
+        while stack:
+            symbol = stack.pop(0)
+            
+            # Xử lý biểu tượng kết thúc (từ)
+            if symbol not in self.grammar:
+                sentence.append(symbol)
+                continue
+                
+            # Lấy các lựa chọn và xác suất
+            options = self.grammar[symbol]
+            
+            # Nếu chỉ có một lựa chọn, không cần mã hóa bit
+            if len(options) == 1:
+                selected = options[0]
+                stack = selected.split() + stack
+                continue
+                
+            # Tạo mã Huffman cho biểu tượng hiện tại
+            huffman_codes = self.build_huffman_codes(symbol)
+            
+            # Cố gắng mã hóa bit nếu còn bit để mã hóa và biểu tượng này chưa được mã hóa
+            encoded = False
+            if bit_index < len(binary_data) and symbol not in encoded_symbols:
+                # Tìm lựa chọn phù hợp với bit tiếp theo
+                for opt, code in huffman_codes.items():
+                    if code and bit_index + len(code) <= len(binary_data):
+                        if binary_data[bit_index:bit_index+len(code)] == code:
+                            selected = opt
+                            bit_index += len(code)
+                            encoded = True
+                            encoded_symbols[symbol] = (opt, code)  # Lưu lại để tránh mã hóa lặp
+                            break
+            
+            # Nếu không thể mã hóa, chọn ngẫu nhiên theo xác suất
+            if not encoded:
+                selected = random.choices(options, weights=self.probabilities[symbol])[0]
+                
+            # Đẩy các từ của lựa chọn vào stack để xử lý tiếp
+            stack = selected.split() + stack
+        
+        # Kết hợp từ thành câu với định dạng đúng
+        text = ' '.join(sentence)
+        
+        # Thêm dấu chấm cho câu nếu cần
+        if text and not text.endswith(('.', '?', '!', ':')):
+            text += '.'
+            
+        result.append(text)
+        
+        # Lưu kết quả hiện tại để sử dụng nếu đạt số lần thử tối đa
+        self.last_result = result
+        
+        # Kiểm tra tính tự nhiên của văn bản và thử lại nếu cần
+        combined_text = '\n'.join(result)
+        if self.check_letter_frequency(combined_text):
+            logger.info(f"Đã mã hóa thành công {bit_index} bit trên tổng số {len(binary_data)} bit")
+            return combined_text
+        else:
+            logger.info(f"Lần thử {attempt + 1}: Tần suất chữ cái không tự nhiên, thử lại")
+            return self.encode(binary_data, max_attempts, attempt + 1)
+
+    def str_to_binary(self, message, key, bits=96):
+        """
+        Chuyển đổi thông điệp thành chuỗi nhị phân sử dụng hàm băm kết hợp với khóa.
+        
+        Args:
+            message (str): Thông điệp cần mã hóa.
+            key (str): Khóa bí mật.
+            bits (int, optional): Số bit đầu ra. Mặc định là 96.
+            
+        Returns:
+            str: Chuỗi nhị phân.
+        """
+        # Kết hợp thông điệp và khóa, băm bằng SHA-256
+        h = hashlib.sha256((message + key).encode()).hexdigest()
+        # Chuyển đổi giá trị băm thành nhị phân
+        binary = bin(int(h, 16))[2:]
+        # Cắt để đảm bảo độ dài cố định
+        return binary.zfill(bits)[:bits]
+
+def main():
+    """Hàm chính điều khiển luồng chương trình."""
+    if len(sys.argv) < 4:
+        print("Sử dụng: python generator.py <grammar_file> <secret_message> <key> [bits] [--enhance]")
+        return 1
+        
+    try:
+        grammar_file = sys.argv[1]
+        secret_message = sys.argv[2]
+        key = sys.argv[3]
+        
+        # Xử lý các tham số tùy chọn
+        bits = 96
+        enhance = False
+        max_bits = None
+        
+        i = 4
+        while i < len(sys.argv):
+            if sys.argv[i] == '--enhance':
+                enhance = True
+                i += 1
+            elif sys.argv[i] == '--max-bits' and i + 1 < len(sys.argv):
+                max_bits = int(sys.argv[i+1])
+                i += 2
+            elif sys.argv[i].isdigit():
+                bits = int(sys.argv[i])
+                i += 1
+            else:
+                i += 1
+        
+        steg = PCFGSteganography(grammar_file)
+        
+        # Tính toán khả năng mã hóa
+        bit_count = 0
+        for symbol, options in steg.grammar.items():
+            if len(options) > 1 and symbol != 'static_text':
+                bit_count += len(options).bit_length() - 1
+        
+        # Giới hạn số bit nếu cần
+        if max_bits is not None and max_bits < bits:
+            bits = max_bits
+            logger.info(f"Giới hạn số bit mã hóa xuống {bits} theo yêu cầu")
+        
+        # Chuyển đổi thông điệp thành chuỗi nhị phân
+        binary_data = steg.str_to_binary(secret_message, key, bits)
+        
+        print(f"Biểu diễn nhị phân của thông điệp bí mật ({bits} bits):")
+        print(binary_data)
+        
+        # Mã hóa thông điệp
+        encoded_text = steg.encode(binary_data)
+        
+        print("\nVăn bản mã hóa:")
+        print(encoded_text)
+        
+        # Hiển thị thông tin khả năng mã hóa
+        print(f"\nThông tin khả năng mã hóa:")
+        print(f"- Số bit tối đa có thể mã hóa: {bit_count}")
+        print(f"- Số bit đã cố gắng mã hóa: {bits}")
+        
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Lỗi: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+ubuntu@steg-pcfg-basic:~$ cat detector.py 
+#!/usr/bin/env python3
+"""
+PCFG Steganography Detector
+
+Phát hiện và giải mã thông tin ẩn trong văn bản sử dụng PCFG.
+"""
+import sys
+import re
+import hashlib
+import logging
+import heapq
+import argparse
+from collections import Counter
+
+# Thiết lập logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+class PCFGDetector:
+    """
+    Lớp phát hiện và giải mã thông tin được giấu bằng PCFG.
+    """
+    def __init__(self, grammar_file):
+        """
+        Khởi tạo đối tượng phát hiện PCFG.
+        
+        Args:
+            grammar_file (str): Đường dẫn đến tệp ngữ pháp PCFG.
+        """
+        self.grammar = {}
+        self.probabilities = {}
+        self.huffman_codes_cache = {}
+        self.wordlist = []
+        self.load_grammar(grammar_file)
+        
+    def load_grammar(self, grammar_file):
+        """
+        Đọc và phân tích tệp ngữ pháp PCFG.
+        
+        Args:
+            grammar_file (str): Đường dẫn đến tệp ngữ pháp PCFG.
+            
+        Raises:
+            FileNotFoundError: Nếu không tìm thấy tệp ngữ pháp.
+        """
+        try:
+            with open(grammar_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            current_symbol = None
+            for line_num, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                    
+                if '→' in line:
+                    parts = line.split('→')
+                    if len(parts) != 2:
+                        logger.warning(f"Lỗi cú pháp ở dòng {line_num}: {line}")
+                        continue
+                        
+                    current_symbol = parts[0].strip()
+                    options_str = parts[1].strip()
+                    options = []
+                    probabilities = []
+                    
+                    for opt in options_str.split('||'):
+                        opt = opt.strip()
+                        if not opt:
+                            continue
+                            
+                        opt_parts = opt.split('|')
+                        if len(opt_parts) < 1:
+                            logger.warning(f"Lỗi cú pháp ở dòng {line_num}: {opt}")
+                            continue
+                            
+                        rule = opt_parts[0].strip()
+                        
+                        try:
+                            prob = float(opt_parts[1].strip()) if len(opt_parts) > 1 else 1.0
+                        except (ValueError, IndexError):
+                            logger.warning(f"Xác suất không hợp lệ ở dòng {line_num}, sử dụng 1.0")
+                            prob = 1.0
+                            
+                        options.append(rule)
+                        probabilities.append(prob)
+                    
+                    self.grammar[current_symbol] = options
+                    self.probabilities[current_symbol] = probabilities
+            
+            logger.info(f"Đã tải ngữ pháp với {len(self.grammar)} biểu tượng không kết thúc")
+            
+        except FileNotFoundError:
+            logger.error(f"Không tìm thấy tệp ngữ pháp: {grammar_file}")
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi khi tải ngữ pháp: {str(e)}")
+            raise
+    
+    def load_wordlist(self, wordlist_file):
+        """
+        Tải danh sách từ điển để hỗ trợ giải mã.
+        
+        Args:
+            wordlist_file (str): Đường dẫn đến tệp từ điển.
+            
+        Returns:
+            bool: True nếu tải thành công, False nếu không.
+        """
+        try:
+            with open(wordlist_file, 'r', encoding='utf-8') as f:
+                self.wordlist = [line.strip() for line in f if line.strip()]
+            logger.info(f"Đã tải từ điển với {len(self.wordlist)} từ")
+            return True
+        except Exception as e:
+            logger.error(f"Lỗi khi tải từ điển: {str(e)}")
+            return False
+            
+    def build_huffman_codes(self, symbol):
+        """
+        Xây dựng mã Huffman cho một biểu tượng không kết thúc.
+        
+        Args:
+            symbol (str): Biểu tượng không kết thúc cần xây dựng mã Huffman.
+            
+        Returns:
+            dict: Từ điển ánh xạ từ lựa chọn đến mã Huffman.
+        """
+        # Kiểm tra cache trước
+        if symbol in self.huffman_codes_cache:
+            return self.huffman_codes_cache[symbol]
+            
+        # Nếu chỉ có một lựa chọn, không cần mã hóa
+        if len(self.grammar[symbol]) <= 1:
+            self.huffman_codes_cache[symbol] = {self.grammar[symbol][0]: ''}
+            return self.huffman_codes_cache[symbol]
+            
+        # Xây dựng heap cho thuật toán Huffman
+        heap = [[prob, [opt, ""]] for opt, prob in zip(self.grammar[symbol], self.probabilities[symbol])]
+        heapq.heapify(heap)
+        
+        # Thuật toán Huffman
+        while len(heap) > 1:
+            lo = heapq.heappop(heap)
+            hi = heapq.heappop(heap)
+            for pair in lo[1:]:
+                pair[1] = '0' + pair[1]
+            for pair in hi[1:]:
+                pair[1] = '1' + pair[1]
+            heapq.heappush(heap, [lo[0] + hi[0]] + lo[1:] + hi[1:])
+        
+        # Lưu kết quả vào cache
+        result = {pair[0]: pair[1] for pair in heapq.heappop(heap)[1:]}
+        self.huffman_codes_cache[symbol] = result
+        return result
+        
+    def detect(self, text):
+        """
+        Phát hiện thông tin ẩn trong văn bản dựa trên ngữ pháp PCFG.
+        Chỉ lấy đúng 1 lựa chọn cho mỗi symbol theo thứ tự CITY, ADJ, FIELD, STUDENT, APPROACH trong MAIN_SENTENCE.
+        """
+        pattern_matches = []
+        binary_bits = []
+
+        # Tìm câu chính chứa 'University'
+        sentences = re.split(r'[.!?]', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        main_sentence = None
+        for sentence in sentences:
+            if re.search(r'\b(University|university)\b', sentence):
+                main_sentence = sentence
+                break
+
+        if not main_sentence:
+            logger.warning("Không tìm thấy câu chính chứa thông tin mã hóa")
+            return False, "", []
+
+        # Xây dựng mã Huffman cho các symbol cần thiết
+        huffman_codes = {}
+        for symbol, options in self.grammar.items():
+            if len(options) >= 2 and symbol not in ['Start', 'INTRO', 'CLOSING']:
+                huffman_codes[symbol] = self.build_huffman_codes(symbol)
+
+        # Chỉ lấy đúng 1 lựa chọn cho mỗi symbol (theo thứ tự)
+        symbol_order = ['CITY', 'ADJ', 'FIELD', 'STUDENT', 'APPROACH']
+        for symbol in symbol_order:
+            found = False
+            for option in self.grammar[symbol]:
+                pattern = r'\b' + re.escape(option) + r'\b'
+                match = re.search(pattern, main_sentence, re.IGNORECASE)
+                if match:
+                    code = huffman_codes[symbol].get(option, '')
+                    if code:
+                        binary_bits.append(code)
+                        pattern_matches.append((symbol, option, code, match.span()))
+                        found = True
+                        break
+            if not found:
+                logger.warning(f"Không tìm thấy lựa chọn cho symbol {symbol} trong câu chính!")
+
+        binary_data = ''.join(binary_bits)
+        detected = len(binary_data) > 0
+        return detected, binary_data, pattern_matches
+    
+    def analyze_letter_frequency(self, text):
+        """
+        Phân tích tần suất chữ cái trong văn bản.
+        
+        Args:
+            text (str): Văn bản cần phân tích.
+            
+        Returns:
+            tuple: (freq_relative, naturality)
+                - freq_relative (dict): Từ điển tần suất chữ cái tương đối.
+                - naturality (float): Chỉ số tự nhiên của văn bản (0-1).
+        """
+        freq = Counter(c.lower() for c in text if c.isalpha())
+        total = sum(freq.values())
+        
+        if total == 0:
+            return {}, 0.0
+        
+        # Tính tần suất tương đối
+        freq_relative = {char: count/total for char, count in freq.items()}
+        
+        # Tần suất tiếng Anh chuẩn (xấp xỉ)
+        expected = {
+            'e': 0.12, 't': 0.09, 'a': 0.08, 'o': 0.075, 'i': 0.07,
+            'n': 0.067, 's': 0.063, 'h': 0.061, 'r': 0.06, 'd': 0.043,
+            'l': 0.04, 'u': 0.028, 'c': 0.028, 'm': 0.025, 'w': 0.024,
+            'f': 0.022, 'g': 0.02, 'y': 0.02, 'p': 0.019, 'b': 0.015,
+            'v': 0.01, 'k': 0.008, 'j': 0.002, 'x': 0.002, 'q': 0.001, 'z': 0.001
+        }
+        
+        # Tính độ chênh lệch
+        deviation = 0
+        for char, exp_freq in expected.items():
+            act_freq = freq_relative.get(char, 0)
+            deviation += abs(act_freq - exp_freq)
+        
+        avg_deviation = deviation / len(expected)
+        naturality = 1 - min(avg_deviation / 0.05, 1.0)  # Quy đổi thành chỉ số 0-1
+        
+        return freq_relative, naturality
+
+    def str_to_binary(self, message, key, bits=96):
+        """
+        Chuyển đổi thông điệp thành chuỗi nhị phân sử dụng hàm băm.
+        
+        Args:
+            message (str): Thông điệp cần mã hóa.
+            key (str): Khóa bí mật.
+            bits (int, optional): Số bit đầu ra. Mặc định là 96.
+            
+        Returns:
+            str: Chuỗi nhị phân.
+        """
+        # Kết hợp thông điệp và khóa, băm bằng SHA-256
+        h = hashlib.sha256((message + key).encode()).hexdigest()
+        # Chuyển đổi giá trị băm thành nhị phân
+        binary = bin(int(h, 16))[2:]
+        # Cắt để đảm bảo độ dài cố định
+        return binary.zfill(bits)[:bits]
+
+    def try_decode(self, text, binary_data, possible_keys):
+        """
+        Cố gắng giải mã thông tin ẩn với các khóa cụ thể.
+        
+        Args:
+            text (str): Văn bản đã mã hóa.
+            binary_data (str): Dữ liệu nhị phân đã phát hiện.
+            possible_keys (list): Danh sách các khóa có thể.
+            
+        Returns:
+            list: Danh sách các thông điệp tiềm năng.
+        """
+        results = []
+        
+        if not binary_data:
+            return results
+            
+        # Phân tích tính tự nhiên của văn bản
+        freq, naturality = self.analyze_letter_frequency(text)
+        
+        # Hiển thị chi tiết về dữ liệu nhị phân được phát hiện
+        logger.info(f"Phát hiện {len(binary_data)} bit dữ liệu nhị phân")
+        logger.info(f"Tính tự nhiên của văn bản: {naturality:.2%}")
+        
+        # Thử giải mã với các khóa
+        for key in possible_keys:
+            try:
+                # Tạo chuỗi băm từ các khóa có thể
+                for potential_message in self.wordlist[:100] if self.wordlist else ["secret", "message", "hidden", "steganography"]:
+                    test_binary = self.str_to_binary(potential_message, key, len(binary_data))
+                    
+                    # So sánh với dữ liệu nhị phân đã phát hiện
+                    similarity = sum(1 for i in range(min(len(binary_data), len(test_binary))) 
+                                   if binary_data[i] == test_binary[i])
+                    confidence = similarity / len(binary_data) if binary_data else 0
+                    
+                    # Nếu độ tương đồng cao, có thể là khóa và thông điệp đúng
+                    if confidence > 0.8:
+                        message = f"Thông điệp có thể là '{potential_message}'"
+                        results.append((key, message, confidence))
+                        break
+                
+                # Nếu không tìm thấy thông điệp cụ thể, báo cáo độ tin cậy chung
+                if not results or results[-1][0] != key:
+                    # So sánh trực tiếp với hash của khóa
+                    test_hash = hashlib.sha256(key.encode()).hexdigest()
+                    bin_hash = bin(int(test_hash, 16))[2:].zfill(256)
+                    
+                    similarity = sum(1 for i in range(min(len(binary_data), len(bin_hash))) 
+                                   if i < len(binary_data) and binary_data[i] == bin_hash[i])
+                    confidence = similarity / min(len(binary_data), 16)
+                    
+                    if confidence > 0.5:
+                        results.append((key, f"Có thể là khóa đúng (độ tin cậy: {confidence:.1%})", confidence))
+                    
+            except Exception as e:
+                logger.error(f"Lỗi khi giải mã với khóa '{key}': {str(e)}")
+        
+        # Sắp xếp kết quả theo độ tin cậy
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results
+
+
+def load_text_file(file_path):
+    """
+    Đọc nội dung từ tệp văn bản.
+    
+    Args:
+        file_path (str): Đường dẫn đến tệp văn bản.
+        
+    Returns:
+        str: Nội dung của tệp.
+        
+    Raises:
+        FileNotFoundError: Nếu không tìm thấy tệp.
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        # Thử lại với mã hóa khác nếu UTF-8 thất bại
+        with open(file_path, 'r', encoding='latin-1') as f:
+            return f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Không tìm thấy tệp văn bản: {file_path}")
+    except Exception as e:
+        raise Exception(f"Lỗi khi đọc tệp: {str(e)}")
+
+def main():
+    """Hàm chính điều khiển luồng chương trình."""
+    parser = argparse.ArgumentParser(description="Phát hiện và giải mã steganography dựa trên PCFG")
+    parser.add_argument("grammar_file", help="Đường dẫn đến tệp ngữ pháp PCFG")
+    parser.add_argument("text_file", help="Đường dẫn đến tệp văn bản cần phân tích")
+    parser.add_argument("--keys", default="", help="Danh sách khóa có thể (phân cách bằng dấu phẩy)")
+    parser.add_argument("--wordlist", help="Tệp từ điển để hỗ trợ giải mã")
+    parser.add_argument("--symbols", help="Chỉ định các biểu tượng cần giải mã (phân cách bằng dấu phẩy)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Hiển thị thông tin chi tiết hơn")
+    
+    args = parser.parse_args()
+    
+    # Thiết lập mức độ chi tiết của nhật ký
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    try:
+        # Tải văn bản
+        text = load_text_file(args.text_file)
+        
+        # Tạo đối tượng phát hiện
+        detector = PCFGDetector(args.grammar_file)
+        
+        # Tải từ điển nếu có
+        if args.wordlist:
+            detector.load_wordlist(args.wordlist)
+        
+        # Phát hiện thông tin ẩn
+        detected, binary_data, pattern_matches = detector.detect(text)
+        
+        # Phân tích kết quả
+        if detected:
+            print("\n[+] Đã phát hiện thông tin ẩn!")
+            print(f"[+] Phát hiện {len(binary_data)} bit dữ liệu ẩn")
+            print(f"[+] Chuỗi bit đã phát hiện: {binary_data}")
+            
+            # Hiển thị chi tiết các mẫu đã phát hiện
+            print("\nChi tiết các mẫu đã phát hiện:")
+            for i, (symbol, option, code, span) in enumerate(pattern_matches, 1):
+                print(f"{i}. Biểu tượng: {symbol}, Lựa chọn: '{option}', Mã Huffman: {code}")
+            
+            # Phân tích tần suất chữ cái
+            freq, naturality = detector.analyze_letter_frequency(text)
+            print(f"\nTính tự nhiên của văn bản: {naturality:.2%}")
+            
+            # Hiển thị 5 tần suất chữ cái cao nhất
+            top_chars = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:5]
+            print("\nTop 5 tần suất chữ cái:")
+            for char, frequency in top_chars:
+                print(f"{char}: {frequency:.3f}")
+            
+            # Danh sách khóa từ tham số
+            possible_keys = [k.strip() for k in args.keys.split(',') if k.strip()]
+            
+            if possible_keys:
+                print("\nThử giải mã với các khóa đã cung cấp:")
+                results = detector.try_decode(text, binary_data, possible_keys)
+                
+                if results:
+                    print("\nKết quả giải mã:")
+                    for key, message, confidence in results:
+                        # Định dạng kết quả dựa trên độ tin cậy
+                        if confidence > 0.7:
+                            print(f"Khóa '{key}' [{confidence:.1%}]: {message}")
+                        else:
+                            print(f"Khóa '{key}' [{confidence:.1%}]: {message}")
+                else:
+                    print("Không thể giải mã với các khóa đã cung cấp.")
+            else:
+                print("\nCung cấp các khóa có thể để thử giải mã.")
+        else:
+            print("[-] Không phát hiện thông tin ẩn sử dụng ngữ pháp đã cung cấp")
+            
+            # Phân tích tần suất chữ cái
+            freq, naturality = detector.analyze_letter_frequency(text)
+            print(f"\nTính tự nhiên của văn bản: {naturality:.2%}")
+            if naturality < 0.8:
+                print("[!] Cảnh báo: Văn bản có tần suất chữ cái bất thường, có thể chứa steganography")
+        
+        return 0
+    
+    except FileNotFoundError as e:
+        print(f"Lỗi: {str(e)}")
+        return 1
+    except Exception as e:
+        logger.error(f"Lỗi: {str(e)}")
+        if args.verbose:
+            import traceback
+            logger.error(traceback.format_exc())
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+ubuntu@steg-pcfg-basic:~$ 
